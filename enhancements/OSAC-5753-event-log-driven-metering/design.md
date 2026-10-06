@@ -68,8 +68,9 @@ Compared with today's metering and the superseded designs:
 
 - A cluster's control plane bills its installation time (PROGRESSING) only once the cluster reaches READY; a cluster
   that fails or is deleted first bills nothing for it. Today it bills from the first PROGRESSING.
-- A cluster's worker nodes bill as the VMs or bare-metal hosts they are, instead of through a per-cluster worker
-  meter, so they bill like any VM or host, including while the cluster installs.
+- A cluster's worker nodes bill as the VMs or bare-metal hosts they are, instead of through the cluster's worker
+  meters (today, one per node set, multiplied by its node count). They bill like any VM or host, including while
+  the cluster installs.
 - With the default rules, allocation meters (bare-metal allocation, volumes, external IPs, NAT gateways) bill until
   the object is physically deleted. OSAC-3141 and OSAC-3145 stopped volumes, external IPs, and NAT gateways at the
   deletion request.
@@ -215,8 +216,10 @@ the rules change, and at every UTC midnight: M360 dates each heartbeat by a sing
 midnight at month end would otherwise fall entirely into one month. Nothing bills after a resource's deletion, even
 if a different clock stamped a later state.
 
-**Fields a rule can use.** The metering code defines which fields of each resource type it tracks. They come in
-three kinds:
+**Fields a rule can use.** Each resource type's tracked fields are defined once, as annotations on its protobuf
+fields: which fields are tracked, of which kind, and which field holds each changing field's change time. Both
+metering's fold and fulfillment's triggers (see Source contract) take their list from these annotations, so the two
+can't drift apart. Tracked fields come in three kinds:
 
 - **Changing fields** report when they changed: the state, a VM's instance type, a cluster's version, and an
   external IP's attachment and attribution.
@@ -232,6 +235,34 @@ holding the complete meter definitions and the time it takes effect (`effective_
 the previous revision; usage before it is still computed with the previous one. For example, if revision 0001 bills
 VMs while RUNNING, and revision 0002, effective January 1, also bills PAUSED, then December's usage follows 0001 and
 January's follows 0002.
+
+A revision looks like this (illustrative; other meters omitted):
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: osac-metering-rules-0002
+immutable: true
+data:
+  effective_at: "2027-01-01T00:00:00Z"
+  meters.yaml: |
+    - resource: ComputeInstance
+      meter: compute
+      unit: second
+      billable_when:
+        states: [RUNNING, PAUSED]
+      dimensions: [instance_type, image, boot_disk_size_gib]
+    - resource: Volume
+      meter: capacity
+      unit: gibibyte_second
+      billable_when:
+        states: [AVAILABLE, DELETING]
+        once: [AVAILABLE]
+        fields: { protocol: BLOCK, vendor_volume_id: set }
+      multiplier: provisioned_size_gib
+      dimensions: [storage_tier]
+```
 
 - Revisions are immutable ConfigMaps, and an admission policy blocks deleting them. Only cluster administrators can
   create them; metering only reads them.
@@ -348,7 +379,7 @@ round(tenant, roundTime):                      # roundTime = 10:01:00, 10:02:00,
     for each piece where should and already differ:
       add a heartbeat to the outbox            # quantity = (should − already) multiplier × piece duration
     ledger[meter] = should
-  progress[tenant].last_round = roundTime
+  progress[tenant].last_round = (roundTime, the event offset folded)
 ```
 
 `should` is computed from `history`. `already` is the ledger, stored in PostgreSQL, so a crash loses nothing: a round
@@ -449,11 +480,12 @@ is brought up to date by catch-up, which every round runs first:
 
 ```
 catchUp(tenant):
-  start = progress[tenant].last_round
+  start = progress[tenant].last_round.time
   read the heartbeat topic from progress[tenant].heartbeat_offset, a bounded number of whole rounds at a time:
     skip a heartbeat whose round time is not after start, or whose ID was already read in this catch-up
     add its multiplier, quantity ÷ (to − from), to ledger[its meter] over [from, to)
-  move the heartbeat offset past what was read, and last_round to the last round read
+  move the heartbeat offset past what was read
+  set last_round to the time and event offset of the last round read   # every heartbeat carries both
 ```
 
 Normally catch-up finds nothing, because the relay has already moved the heartbeat offset past every heartbeat it
@@ -497,7 +529,8 @@ every write to a billable resource, including direct SQL:
   turn one fact into two, and a backward one would end billing early. Keeping the old time, rather than rejecting
   the write, means a timestamp never blocks a status update.
 - **Fixed fields don't change.** Fields known at creation never change, and fields set once never change after they
-  are set.
+  are set. A field is annotated as fixed only if the API already rejects changing it; otherwise the trigger would
+  reject legitimate writes.
 - A write that breaks these rules fails, and its transaction rolls back.
 
 Together, these rules give every history row exactly one possible value, which is what makes the fold safe to repeat
