@@ -149,8 +149,8 @@ a release, then a claim; in between, the IP is its own root.
 | Volume (VM disk) | ComputeInstance | Open question | Deleted, held until gone (OSAC-6037) |
 
 Deleting a holder that still has a manually attached IP is refused until the user detaches it, as the networking
-design specifies (OSAC-1433). The detach releases the IP as soon as it starts, so the IP can be attached elsewhere
-right away.
+design specifies (OSAC-1433). The detach releases the IP only after the ExternalIPAttachment is fully deleted, so the IP
+can be attached elsewhere without an active attachment remaining.
 
 `part` names the node set of a worker, the cluster endpoint an IP serves, or the VM disk a volume backs. Workers get
 theirs once they have node sets.
@@ -200,8 +200,8 @@ A resource type without these checks fails CI.
 
 ## Provenance
 
-Committed: commit @ design 0.11.3 - 9b25062, workspace main @ 63b090a
+Authored: respond @ design 0.11.3 - 9b25062, workspace main @ 63b090a
 
-> Authoring phases not recorded this session (commit-time snapshot only).
+> This document's phase history does not include an initial /draft — structure was not verified against the template from origin.
 
-<!-- ai-workflow-provenance:{"schema_version":1,"provenance_kind":"commit_only","workflow":"design","workflow_version":"0.11.3","ai_workflows":"9b25062","source_repo":"63b090a","source_repo_branch":"main","commits_behind_main":0,"commits_ahead_main":0,"main_ref":"main","phases":["commit","commit"],"authoring_modes":["skill"],"context_changed":false,"origin_untracked":false} -->
+<!-- ai-workflow-provenance:{"schema_version":1,"provenance_kind":"session","workflow":"design","workflow_version":"0.11.3","ai_workflows":"9b25062","source_repo":"63b090a","source_repo_branch":"main","commits_behind_main":0,"commits_ahead_main":0,"main_ref":"main","phases":["commit","commit","respond"],"authoring_modes":["skill"],"context_changed":false,"origin_untracked":true} -->
