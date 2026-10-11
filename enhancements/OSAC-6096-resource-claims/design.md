@@ -5,6 +5,7 @@ authors:
 creation-date: 2026-10-07
 last-updated: 2026-10-11
 tracking-link:
+  - https://redhat.atlassian.net/browse/OSAC-6096
   - https://redhat.atlassian.net/browse/OSAC-6299
 see-also:
   - "/enhancements/OSAC-5753-event-log-driven-metering"
@@ -199,8 +200,8 @@ A resource type without these checks fails CI.
 
 ## Provenance
 
-Committed: commit @ design 0.11.3 - 9b25062, workspace design/OSAC-6299 @ 3da4e31
+Committed: commit @ design 0.11.3 - 9b25062, workspace main @ 63b090a
 
 > Authoring phases not recorded this session (commit-time snapshot only).
 
-<!-- ai-workflow-provenance:{"schema_version":1,"provenance_kind":"commit_only","workflow":"design","workflow_version":"0.11.3","ai_workflows":"9b25062","source_repo":"3da4e31","source_repo_branch":"design/OSAC-6299","commits_behind_main":0,"commits_ahead_main":0,"main_ref":"main","phases":["commit"],"authoring_modes":["skill"],"context_changed":false,"origin_untracked":false} -->
+<!-- ai-workflow-provenance:{"schema_version":1,"provenance_kind":"commit_only","workflow":"design","workflow_version":"0.11.3","ai_workflows":"9b25062","source_repo":"63b090a","source_repo_branch":"main","commits_behind_main":0,"commits_ahead_main":0,"main_ref":"main","phases":["commit","commit"],"authoring_modes":["skill"],"context_changed":false,"origin_untracked":false} -->
