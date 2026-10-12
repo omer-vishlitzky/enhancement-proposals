@@ -3,7 +3,7 @@ title: event-log-driven-metering
 authors:
   - ovishlit@redhat.com
 creation-date: 2026-09-30
-last-updated: 2026-10-05
+last-updated: 2026-10-12
 tracking-link:
   - https://redhat.atlassian.net/browse/OSAC-985
   - https://redhat.atlassian.net/browse/OSAC-5753
@@ -25,8 +25,9 @@ Metering reads those topics directly and turns them into usage:
 
 - **Billing rules are data.** Versioned ConfigMaps say when each resource bills, for example "a VM bills while it is
   RUNNING". There are no hard-coded state machines.
-- **Metering sends differences.** Every minute it compares what should have been billed with what it already sent,
-  and sends the difference, positive or negative. M360 adds the differences up and applies prices.
+- **Metering sends differences.** Every minute it compares expected usage with the actual net usage recorded for
+  publication, and sends the difference, positive or negative. The billing provider adds the differences up and applies
+  prices.
 - **Everything can be rebuilt from Kafka.** Losing or restoring the metering database never bills usage twice and
   never loses any.
 
@@ -40,9 +41,10 @@ Today's metering has three problems:
   issue conflicting corrections.
 - **Hard-coded transitions.** Billing behavior lives in per-resource state-transition tables in code, so every rule
   change is a code change.
-- **Double billing after a restore.** M360 is append-only and drops only a heartbeat whose ID it has already seen.
+- **Double billing after a restore.** The billing provider is append-only and drops only a heartbeat whose ID it has
+  already seen.
   A database restored from a backup doesn't know which heartbeats were sent after the backup was taken, so it sends
-  that time again under new IDs, and M360 bills it twice.
+  that time again under new IDs, and the billing provider bills it twice.
 
 ### Goals
 
@@ -57,7 +59,8 @@ Today's metering has three problems:
 
 ### Non-Goals
 
-- Pricing, invoices, quotas, and user-facing usage views. M360 owns pricing; this pipeline only produces usage.
+- Pricing, invoices, quotas, and user-facing usage views. The billing provider owns pricing; this pipeline only
+  produces usage.
 - MaaS, which stays metered as it is today, separately from this pipeline.
 - Migrating existing deployments. This is greenfield: nothing old is migrated, and the previous pipeline is removed.
 - Vendor-fed bandwidth metering.
@@ -66,8 +69,9 @@ Today's metering has three problems:
 
 Compared with today's metering and the superseded designs:
 
-- A cluster's control plane bills its installation time (PROGRESSING) only once the cluster reaches READY; a cluster
-  that fails or is deleted first bills nothing for it. Today it bills from the first PROGRESSING.
+- A cluster's control plane bills PROGRESSING installation time retroactively when it reaches READY, as well as its
+  time in READY; if the cluster fails or is deleted before READY, it bills no installation time. Today it bills from
+  the first PROGRESSING.
 - A cluster's worker nodes bill as the VMs or bare-metal hosts they are, instead of through the cluster's worker
   meters (today, one per node set, multiplied by its node count). They bill like any VM or host, including while
   the cluster installs.
@@ -99,8 +103,8 @@ flowchart LR
   rules["Rule revisions<br/>(ConfigMaps)"] --> round
   relay -->|"heartbeats"| beats(["osac.metering.heartbeat.*"])
   beats -->|"catch-up"| round
-  beats --> adapter["M360 adapter"]
-  adapter --> m360[("M360<br/>prices and invoices")]
+  beats --> adapter["Billing Provider adapter"]
+  adapter --> billing_provider[("Billing Provider<br/>prices and invoices")]
   adapter -->|"rejected"| dlq(["osac.metering.dlq.*"])
 ```
 
@@ -110,8 +114,8 @@ flowchart LR
 | Fold | Every event | Adds a history row for every changed fact; facts it already has change nothing. |
 | Heartbeat round | Every minute, per tenant | Catches up, computes what should be billed, and writes the difference. |
 | Relay | Continuously | Sends the heartbeats a round wrote to the tenant's heartbeat topic. |
-| M360 adapter | Continuously | Forwards heartbeats to M360; moves rejected ones to the tenant's dead-letter topic. |
-| M360 | On receipt | Drops repeated heartbeat IDs, applies prices, and invoices. |
+| Billing Provider adapter | Continuously | Forwards heartbeats to the provider; sends rejections to the tenant's DLQ. |
+| Billing Provider | On receipt | Drops repeated heartbeat IDs, applies prices, and invoices. |
 
 ### Key ideas
 
@@ -120,9 +124,9 @@ flowchart LR
 2. **Rules are versioned data.** A meter definition says which states bill, the unit and multiplier, and the
    dimensions to send. Rules change by adding a revision that takes effect at a future time, so past usage is always
    computed with the rules it was billed under.
-3. **Send differences, not totals.** Metering keeps a ledger of what it already sent. Each round sends
-   `should − already`, so a late event or a correction is just another difference. Both sides can be rebuilt from
-   Kafka: "should" from the event topic, "already" from the heartbeat topic.
+3. **Send differences, not totals.** Metering keeps a ledger of the net usage it has committed for publication. Each
+   round sends `expected − actual`, so a late event or a correction is just another difference. Both sides can be
+   rebuilt from Kafka: `expected` from the event topic, `actual` from the heartbeat topic.
 
 ### Example
 
@@ -154,8 +158,8 @@ Each tenant has three topics, created together by tenant onboarding (OSAC-983 de
 | Topic | Written by | Read by |
 |---|---|---|
 | `osac.events.<tenant>` | Fulfillment's event publisher | Metering |
-| `osac.metering.heartbeat.<tenant>` | Metering | The M360 adapter, and metering itself to catch up |
-| `osac.metering.dlq.<tenant>` | The M360 adapter | Operators |
+| `osac.metering.heartbeat.<tenant>` | Metering | The Billing Provider adapter, and metering itself to catch up |
+| `osac.metering.dlq.<tenant>` | The Billing Provider adapter | Operators |
 
 All three have one partition and are never compacted. They keep records for the **retention period**: indefinitely by
 default, and configurable per installation. Metering rebuilds its database from these topics (see Recovery), so the
@@ -179,9 +183,12 @@ Every meter also sends these dimensions: `deployment` (an ID configured per inst
 tenant, project, catalog, template, and meter type.
 
 **`once`.** Some time should be billed only if the resource eventually became usable. `once: <states>` means: after
-creation, and after any non-billable state, bill nothing until the resource reaches one of those states; when it
-does, also bill the time since then. A cluster with `once: READY` bills its installation time once it is ready, and
-nothing if the installation fails.
+creation, and after any non-billable state, defer billing for a billable span until the resource reaches one of those
+states. When it does, bill retroactively from the start of that span, including any preceding billable states, then
+continue billing normally while the resource remains billable. If the resource enters a non-billable state first,
+do not bill that span. For example, a cluster with `once: READY` bills its preceding PROGRESSING time retroactively
+when it reaches READY, as well as its time in READY. If installation fails or the cluster is deleted before READY,
+that installation time is not billed.
 
 **Default meters.** FAILED is never billable. A CSP can change any of this with its own revisions (see Rule
 revisions).
@@ -212,9 +219,9 @@ their own meters.
 
 **Counting time.** Durations are exact, to the microsecond. A run, a span during which a meter is continuously
 billable, that lasts less than one second is not billed (CAP-4). Usage is split wherever the state, a dimension, or
-the rules change, and at every UTC midnight: M360 dates each heartbeat by a single timestamp, so a piece crossing
-midnight at month end would otherwise fall entirely into one month. Nothing bills after a resource's deletion, even
-if a different clock stamped a later state.
+the rules change, and at every UTC midnight: the billing provider dates each heartbeat by a single timestamp, so a
+piece crossing midnight at month end would otherwise fall entirely into one month. Nothing bills after a resource's
+deletion, even if a different clock stamped a later state.
 
 **Fields a rule can use.** Each resource type's tracked fields are defined once, as annotations on its protobuf
 fields: which fields are tracked, of which kind, and which field holds each changing field's change time. Both
@@ -298,8 +305,8 @@ Every table can be rebuilt from Kafka or from the revision ConfigMaps (see Recov
 
 | Table | Holds | Written by | Used for | Rebuilt from |
 |---|---|---|---|---|
-| `history` | Facts: a resource's field, its value, and since when | Fold | Computing `should` | Event topic |
-| `ledger` | Per meter: intervals sent, with multipliers | Round, catch-up | Computing `already` | Heartbeat topic |
+| `history` | Facts: a resource's field, its value, and since when | Fold | Computing `expected` | Event topic |
+| `ledger` | Per meter: intervals committed for publication, with multipliers | Round, catch-up | Computing `actual` | Heartbeat topic |
 | `outbox` | Heartbeats a round wrote, not yet on Kafka | Round; the relay deletes | Sending safely | Not needed |
 | `progress` | Per tenant: event and heartbeat offsets, last round time and offset | All loops | Resuming | Topics |
 | `rule_revisions` | Each revision used, with its `effective_at` | Startup | Startup checks | ConfigMaps |
@@ -373,18 +380,18 @@ round(tenant, roundTime):                      # roundTime = 10:01:00, 10:02:00,
   catchUp(tenant)                              # see Recovery; normally finds nothing
   if catch-up isn't finished, or the tenant's events aren't all folded yet:
     stop                                       # try again next round
-  for each meter in should or in the ledger:   # only those that can have changed (see below)
-    should  = usage(meter, upTo = roundTime)   # computed from history and the rules; never stored
-    already = ledger[meter]                    # stored in PostgreSQL
-    for each piece where should and already differ:
-      add a heartbeat to the outbox            # quantity = (should − already) multiplier × piece duration
-    ledger[meter] = should
+  for each meter with expected usage or a ledger entry: # only those that can have changed (see below)
+    expected = usage(meter, upTo = roundTime)  # computed from history and the rules; never stored
+    actual = ledger[meter]                     # committed usage, stored in PostgreSQL
+    for each piece where expected and actual differ:
+      add a heartbeat to the outbox            # quantity = (expected − actual) multiplier × piece duration
+    ledger[meter] = expected
   progress[tenant].last_round = (roundTime, the event offset folded)
 ```
 
-`should` is computed from `history`. `already` is the ledger, stored in PostgreSQL, so a crash loses nothing: a round
-commits its ledger and its heartbeats together, or neither. After a database restore, catch-up brings the ledger up
-to date before anything is compared.
+`expected` is computed from `history`. `actual` is the ledger: net usage committed for publication, stored in
+PostgreSQL. A round commits its ledger and its heartbeats together, or neither. After a database restore, catch-up
+rebuilds the ledger from the heartbeat topic before anything is compared.
 
 A round visits meters in the ledger too, because a late event can remove a meter entirely. Example: VM-7 runs as type
 small; the operator reports a resize to large at 10:30, and the next three rounds send +60 s each on the large meter.
@@ -407,13 +414,13 @@ billable gets one heartbeat, for the latest interval, and other meters get none.
 
 The round's time comes from PostgreSQL's clock, so all pods agree on it, and each round's time is later than the
 previous one. A shorter interval keeps running totals fresher; a longer one sends fewer heartbeats, and each
-heartbeat is a rated transaction in M360.
+heartbeat is a rated transaction in the billing provider.
 
 **The relay.** A database transaction and a Kafka write can't commit together. So a round doesn't send heartbeats
 itself: it writes them to the outbox in the same transaction as the ledger, and the database stays consistent
 whatever crashes. The relay, a separate loop, sends outbox rows to the tenant's heartbeat topic in order, waits for
 Kafka to confirm, then deletes them and moves the tenant's heartbeat offset. If it crashes after sending and before
-deleting, it sends them again with the same IDs, and M360 drops the copies.
+deleting, it sends them again with the same IDs, and the billing provider drops the copies.
 
 #### Heartbeats
 
@@ -455,14 +462,14 @@ A heartbeat is one CloudEvent (`osac.resource.heartbeat.v1`) on the tenant's hea
 - The `id` is a hash of tenant, resource, meter, component, dimensions, `from`, `to`, and round time. It names which
   piece of usage this is (what and when), and those fields are already unique. It leaves out the quantity, so a
   resent heartbeat keeps its ID even if a later release formats the number differently. Different rounds never
-  share an ID, because their round times differ; if a round is sent twice, M360 drops the copies.
+  share an ID, because their round times differ; if a round is sent twice, the billing provider drops the copies.
 - Consumers add heartbeats up; they never replace one.
 
-#### Delivery to M360
+#### Delivery to the billing provider
 
-The M360 adapter reads every tenant's heartbeat topic and forwards each heartbeat with its ID; M360 drops IDs it has
-already seen. If M360 rejects a heartbeat, the adapter moves it to the tenant's dead-letter topic (DLQ) and keeps
-going. The DLQ is mandatory: the adapter refuses to start without one.
+The billing provider adapter reads every tenant's heartbeat topic and forwards each heartbeat with its ID; the billing
+provider drops IDs it has already seen. If the billing provider rejects a heartbeat, the adapter moves it to the
+tenant's dead-letter topic (DLQ) and keeps going. The DLQ is mandatory: the adapter refuses to start without one.
 
 A notification stays on while a tenant's DLQ has unhandled records; the handled position is a consumer-group offset.
 Once the cause is fixed, an operator replays them:
@@ -470,7 +477,7 @@ Once the cause is fixed, an operator replays them:
 1. Stop the adapter.
 2. Reset its position on the tenant's heartbeat topic to the earliest unhandled record's original offset.
 3. Mark the DLQ handled up to its end.
-4. Restart the adapter. M360 drops the heartbeats it already has.
+4. Restart the adapter. The billing provider drops the heartbeats it already has.
 
 #### Recovery
 
@@ -492,8 +499,8 @@ Normally catch-up finds nothing, because the relay has already moved the heartbe
 sent. After a restore, it finds the heartbeats sent after the backup was taken.
 
 Example: a backup records a running VM as billed until 10:02. Heartbeats for 10:02–10:05 were sent before the
-database was lost, and the backup is restored at 10:10. Without catch-up, the 10:11 round would send 10:02–10:11, and
-M360 would bill 10:02–10:05 twice. With catch-up, the round sends only 10:05–10:11.
+database was lost, and the backup is restored at 10:10. Without catch-up, the 10:11 round would send 10:02–10:11,
+and the billing provider would bill 10:02–10:05 twice. With catch-up, the round sends only 10:05–10:11.
 
 An empty database is just an old backup: the fold replays every event from offset 0, and catch-up replays every
 heartbeat. Both need the topics to still hold those records, which the retention period decides.
@@ -508,7 +515,7 @@ heartbeat. Both need the topics to still hold those records, which the retention
 | Two metering pods run at once | Each loop locks the tenant, so the tenant's work runs one at a time. |
 | The database is restored from a backup | Catch-up adds what was sent after the backup; nothing is sent twice. |
 | The database is lost | It is rebuilt from the topics, starting at offset 0. |
-| M360 rejects a heartbeat | It goes to the tenant's DLQ, and a notification stays on until it is replayed. |
+| Provider rejects a heartbeat | It enters the tenant's DLQ; notification stays on until replayed. |
 | A new rule revision is added | It takes effect at its `effective_at`, once metering has restarted. |
 | A writer re-reports a time but not a new value | Fulfillment keeps the old time (see Source contract). |
 | A pod's clock and PostgreSQL's differ by over five minutes | The round is skipped, with a notification. |
@@ -564,7 +571,7 @@ Fulfillment also guarantees:
   heartbeat topics and writes DLQs; fulfillment can't create topics.
 - **Notifications:** a notification mechanism exists (OSAC has none today). Metering, fulfillment, and the adapter
   use it for startup refusals, quarantined changes, and non-empty DLQs.
-- **M360 contract test**, run against a real M360 tenant, confirming that M360:
+- **Billing Provider contract test**, run against a real tenant of the billing provider, confirming that it:
   - rates negative quantities as negative charges;
   - prices a heartbeat at the rate in effect at its time, so a correction cancels exactly what it corrects;
   - drops a repeated heartbeat ID permanently;
@@ -589,8 +596,8 @@ Fulfillment also guarantees:
 ## Test Plan
 
 Every test checks the same expected result: once the system settles, each tenant's heartbeats add up to the usage the
-rules give over its full event log, and no heartbeat ID is billed twice. After any DLQ replay, M360 holds exactly the
-heartbeats metering sent. The companion test plan lists the cases.
+rules give over its full event log, and no heartbeat ID is billed twice. After any DLQ replay, the billing provider
+holds exactly the heartbeats metering sent. The companion test plan lists the cases.
 
 Unit and integration tests, against real PostgreSQL and Kafka, gate every merge:
 
@@ -609,14 +616,15 @@ Unit and integration tests, against real PostgreSQL and Kafka, gate every merge:
 - **Source contract:** the triggers reject a value change without a later time and any change to a fixed field, and
   keep the old time when only the time changes.
 
-The M360 contract test checks the M360 prerequisites against a real M360 tenant.
+The contract test checks the billing provider prerequisites against a real tenant of the billing provider.
 
 End-to-end chaos tests run on a deployed hub: kill metering at random points; run two pods through rolling upgrades;
 restore database backups minutes and hours old, and rebuild from an empty database; restart Kafka brokers and cut
-the network; delay controller updates for hours; jump the pod's and the database's clocks forward and back; take M360
-down, and make it reject a heartbeat, then fix the cause and replay the DLQ.
+the network; delay controller updates for hours; jump the pod's and the database's clocks forward and back; take the
+billing provider down, and make it reject a heartbeat, then fix the cause and replay the DLQ.
 
-Graduation: the chaos suite passes repeatedly with zero billing difference, and the M360 contract test passes.
+Graduation: the chaos suite passes repeatedly with zero billing difference, and the billing provider contract test
+passes.
 
 ---
 
