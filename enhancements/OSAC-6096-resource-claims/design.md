@@ -217,6 +217,10 @@ a VM's automatic IP and disks.
 - **Attribute an attached resource to what it is attached to.** Usage would move whenever an attachment moves.
 - **Make automatic IPs and volumes created-for.** Their designs let them leave or outlive the resource they serve.
 - **Record it on the target, as a list of workers on the cluster.** Every type needs a list, plus a uniqueness check.
+- **Kubernetes-style metadata.owner_references.** created_for is the Kubernetes controller owner reference with
+foreground deletion. It drops the list and the edits: several owners leave no single tenant and project to attribute
+usage to, and adopting or orphaning would move usage between projects. If several owners are ever needed, the
+field can become a list without breaking the wire format.
 
 ## Open Questions
 
