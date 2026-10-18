@@ -3,7 +3,7 @@ title: event-log-driven-metering
 authors:
   - ovishlit@redhat.com
 creation-date: 2026-09-30
-last-updated: 2026-10-12
+last-updated: 2026-10-18
 tracking-link:
   - https://redhat.atlassian.net/browse/OSAC-985
   - https://redhat.atlassian.net/browse/OSAC-5753
@@ -274,7 +274,7 @@ data:
 - Revisions are immutable ConfigMaps, and an admission policy blocks deleting them. Only cluster administrators can
   create them; metering only reads them.
 - Metering reads revisions when it starts, so a new revision needs a metering restart before its `effective_at`.
-  Metering refuses to start, with a notification, if a new revision would take effect in the past, or if a revision
+  Metering refuses to start, with an alert, if a new revision would take effect in the past, or if a revision
   it has already used is missing.
 
 **Changing the metering code.** Rules are meant to change; the code that folds events and evaluates rules is not. CI
@@ -471,7 +471,9 @@ The billing provider adapter reads every tenant's heartbeat topic and forwards e
 provider drops IDs it has already seen. If the billing provider rejects a heartbeat, the adapter moves it to the
 tenant's dead-letter topic (DLQ) and keeps going. The DLQ is mandatory: the adapter refuses to start without one.
 
-A notification stays on while a tenant's DLQ has unhandled records; the handled position is a consumer-group offset.
+An alert stays on while a tenant's DLQ has unhandled records; the handled position is a consumer-group offset.
+Metering exposes, per tenant, the depth of the DLQ, the age of its oldest unhandled record, and how long the latest
+heartbeat has waited unconfirmed. The alerts key on these.
 Once the cause is fixed, an operator replays them:
 
 1. Stop the adapter.
@@ -515,12 +517,12 @@ heartbeat. Both need the topics to still hold those records, which the retention
 | Two metering pods run at once | Each loop locks the tenant, so the tenant's work runs one at a time. |
 | The database is restored from a backup | Catch-up adds what was sent after the backup; nothing is sent twice. |
 | The database is lost | It is rebuilt from the topics, starting at offset 0. |
-| Provider rejects a heartbeat | It enters the tenant's DLQ; notification stays on until replayed. |
+| Provider rejects a heartbeat | It enters the tenant's DLQ; the alert stays on until replayed. |
 | A new rule revision is added | It takes effect at its `effective_at`, once metering has restarted. |
 | A writer re-reports a time but not a new value | Fulfillment keeps the old time (see Source contract). |
-| A pod's clock and PostgreSQL's differ by over five minutes | The round is skipped, with a notification. |
+| A pod's clock and PostgreSQL's differ by over five minutes | The round is skipped, with an alert. |
 | PostgreSQL's clock moves backwards | Rounds wait until it passes the last round time. |
-| A revision metering has used is missing | Metering refuses to start, with a notification. |
+| A revision metering has used is missing | Metering refuses to start, with an alert. |
 | A captured change can't become an event | It is quarantined; the tenant's later events wait until it's republished. |
 | A tenant's topics are deleted after its final invoice | Metering stops the tenant and deletes its rows. |
 
@@ -558,7 +560,7 @@ Fulfillment also guarantees:
   need it, but it keeps the contract clean: a future meter that counts occurrences would key its facts by event ID.
 - **Deletion time.** Physical deletion is stamped when fulfillment deletes the row, after finalizers, and published
   as the deletion event's timestamp. The deletion request shows up earlier, as the DELETING state.
-- **No gaps.** A captured change that can't be converted to an event is quarantined, with a notification. The
+- **No gaps.** A captured change that can't be converted to an event is quarantined, with an alert. The
   publisher holds back that tenant's later events until the change is fixed and republished; it is never dropped.
 - **One writer per topic.** A single, fenced publisher writes each tenant's event topic.
 
@@ -569,8 +571,8 @@ Fulfillment also guarantees:
   retention period; onboarding creates each tenant's three topics.
 - **Topic permissions:** metering reads event topics and reads and writes heartbeat topics; the adapter reads
   heartbeat topics and writes DLQs; fulfillment can't create topics.
-- **Notifications:** a notification mechanism exists (OSAC has none today). Metering, fulfillment, and the adapter
-  use it for startup refusals, quarantined changes, and non-empty DLQs.
+- **Alerts:** alert rules exist for metering, fulfillment, and the adapter: startup refusals, quarantined changes,
+  and non-empty DLQs. Platform pipeline health is an operational concern, carried by the monitoring stack.
 - **Billing Provider contract test**, run against a real tenant of the billing provider, confirming that it:
   - rates negative quantities as negative charges;
   - prices a heartbeat at the rate in effect at its time, so a correction cancels exactly what it corrects;
