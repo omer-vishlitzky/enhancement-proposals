@@ -531,8 +531,12 @@ heartbeat. Both need the topics to still hold those records, which the retention
 Usage is only as accurate as the facts fulfillment reports. Database triggers in fulfillment's database enforce, for
 every write to a billable resource, including direct SQL:
 
-- **A value change comes with a later time.** A changed state needs a later `state_transition_time`, and a changed
-  changing field needs a later change time (see the table below).
+- **A value change comes with its time.** A changed state needs its `state_transition_time`, and a changed changing
+  field needs its change time (see the table below). A missing time is a writer bug, so the write rolls back. A time
+  on or before the stored one is not: Kubernetes CR stamps truncate to whole seconds, so two changes observed in the
+  same second carry the same time, and a skewed clock reports an earlier one. The write is accepted and the stored
+  time clamped to the old one plus one microsecond. The first time of a value clamps past the creation timestamp, so
+  it cannot collide with the fold's creation-time fact.
 - **A time changes only with its value.** If a write changes a change time but not the value, the trigger keeps the
   old time. Two writers with different clocks, or an operator re-reporting a phase after a restart, would otherwise
   turn one fact into two, and a backward one would end billing early. Keeping the old time, rather than rejecting
@@ -615,8 +619,9 @@ Unit and integration tests, against real PostgreSQL and Kafka, gate every merge:
   catching up at once apply each heartbeat once; a long backlog is applied in bounded steps.
 - **Durations:** a run from 10:00:00.2 to 10:00:02.8 bills exactly 2.6 s; a dimension change at 10:00:01.5 splits
   it into 1.3 s and 1.3 s; a run under one second bills nothing; a piece crossing midnight splits in two.
-- **Source contract:** the triggers reject a value change without a later time and any change to a fixed field, and
-  keep the old time when only the time changes.
+- **Source contract:** the triggers reject a value change without its time and any change to a fixed field, clamp a
+  change time on or before the stored one to the stored one plus a microsecond, and keep the old time when only the
+  time changes.
 
 The contract test checks the billing provider prerequisites against a real tenant of the billing provider.
 
