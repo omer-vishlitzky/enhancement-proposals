@@ -153,7 +153,7 @@ change, and CI checks wire compatibility.
 
 #### Topics
 
-Each tenant has three topics, created together by tenant onboarding (OSAC-983 defines how):
+Each tenant has three topics. Each component creates its own: fulfillment's event publisher creates the event topic when it first publishes for the tenant, and metering creates the heartbeat and dead-letter topics on the pass that first serves the tenant.
 
 | Topic | Written by | Read by |
 |---|---|---|
@@ -168,7 +168,7 @@ rebuilding an empty database needs every record. A future retention job will mov
 period to cold storage, where recovery can still read them by offset. A tenant's topics may be deleted only after its
 final invoice; metering then stops the tenant and deletes its rows.
 
-Metering and the adapter discover tenants by listing topics, start a new tenant at offset 0, and never create topics.
+Metering and the adapter discover tenants by listing event topics, start a new tenant at offset 0, and create only their own topics.
 
 #### Meter definitions
 
