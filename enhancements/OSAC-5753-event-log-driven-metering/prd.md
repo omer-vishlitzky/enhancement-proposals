@@ -53,10 +53,10 @@ Beyond raw metering, providers need a pricing layer to define rate schedules, ge
 |---------|-------|
 | VMaaS | In scope |
 | CaaS | In scope |
-| MaaS | In scope (capabilities defined; data source ownership to be resolved during design) |
-| BMaaS | Bare-metal allocation and consumption |
-| Storage-aaS | Block Volume capacity |
-| Networking | ExternalIP and NATGateway allocation; no bandwidth metering |
+| MaaS | In scope; capabilities defined, data source ownership to be resolved during design |
+| BMaaS | In scope; bare-metal allocation and consumption |
+| Storage-aaS | In scope; block Volume capacity only |
+| Networking | In scope; ExternalIP and NATGateway allocation; bandwidth metering out of scope |
 
 ## 3. Capabilities
 
@@ -85,7 +85,7 @@ Beyond raw metering, providers need a pricing layer to define rate schedules, ge
 ### 3.5 Cross-cutting
 
 - **CAP-11:** VMaaS metering is consumption-based. Compute metering (instance-type-seconds) runs only while the VM is active (running). Stopped and paused VMs do not actively consume host compute resources, so compute is not metered in those states. However, resources allocated to a VM that remain reserved regardless of VM state — including storage volumes and public IPs — continue to consume infrastructure capacity (storage space, IP pool addresses) and must continue to be metered for the full duration of the VM's existence, even while the VM is stopped or paused. VMs in failed state are not metered (see D-5). All metered resources belonging to a VM (and — when in scope — storage, public IPs) must be attributable to the parent VM so that the full cost of a VM can be queried as a unified view.
-- **CAP-12:** CaaS metering is consumption-based — only active clusters (ready or progressing) are metered, and a cluster that fails or is deleted before it first becomes ready is not billed. A failed cluster is not reliably serving workloads and its constituent nodes may be in an indeterminate state; metering a failed cluster risks double-counting alongside any replacement the provider spins up. All metered resources belonging to a cluster (control plane, worker nodes, and — when in scope — storage, networking) must be attributable to the parent cluster so that the full cost of a cluster can be queried as a unified view.
+- **CAP-12:** CaaS metering is consumption-based — only active clusters (ready or progressing) are metered, and a cluster that fails or is deleted before it first becomes ready is not billed, including its worker nodes. A failed cluster is not reliably serving workloads and its constituent nodes may be in an indeterminate state; metering a failed cluster risks double-counting alongside any replacement the provider spins up. All metered resources belonging to a cluster (control plane, worker nodes, and — when in scope — storage, networking) must be attributable to the parent cluster so that the full cost of a cluster can be queried as a unified view.
 - **CAP-13:** MaaS metering is consumption-based — charged per token and per inference request, not per allocated model instance. GPU infrastructure cost is embedded in the provider's per-token/per-model pricing. MaaS usage data is available for query within 60 seconds of an inference request completing, so that downstream systems (e.g., quota enforcement, when available) can evaluate against near-real-time balances. This latency requirement does not apply to VMaaS or CaaS, where delays up to the polling interval are acceptable.
 - **CAP-14:** The metering system can be deployed independently without affecting existing OSAC provisioning. Providers who use their own metering solution can consume OSAC's lifecycle data without deploying the built-in metering stack.
 - **CAP-15:** Upgrading the metering system does not cause loss of collected metering data or gaps in measurement of ongoing workloads.
@@ -95,7 +95,7 @@ Beyond raw metering, providers need a pricing layer to define rate schedules, ge
 ## 4. Operational Expectations
 
 - Event, heartbeat, and dead-letter records needed to rebuild metering state are retained indefinitely.
-- Aggregated metering data must be retained for at least 13 months to support annual billing audits. The retention period must be configurable.
+- Aggregated metering data must be retained for at least 13 months to support annual billing audits. The retention period is configurable, but never below 13 months.
 - The metering ingestion layer must scale to handle concurrent lifecycle events from multiple tenants' resources without dropping events or introducing delays that exceed the polling interval.
 
 ## 5. Acceptance Criteria
@@ -112,6 +112,7 @@ Beyond raw metering, providers need a pricing layer to define rate schedules, ge
 
 - [ ] An active cluster generates separate usage data for the control plane and for each worker node set
 - [ ] Worker node usage can be broken down by resource class, enabling differentiated pricing for GPU vs CPU
+- [ ] A cluster that fails or is deleted before it first becomes ready generates no usage data, for its control plane or its worker nodes (CAP-12)
 - [ ] All metered resources belonging to a cluster (control plane, worker nodes) can be queried as a unified cluster-level usage view
 - [ ] A billing system can determine the catalog item, cluster version, and per-node-set host type for any metered cluster from the metering data alone
 
@@ -129,12 +130,13 @@ Beyond raw metering, providers need a pricing layer to define rate schedules, ge
 - [ ] A Tenant User can view usage for the projects they belong to in the osac-ui console
 - [ ] A Cloud Provider Admin can view usage across all tenants
 - [ ] A Cloud Provider Admin can view usage across all tenants in the osac-ui console
-- [ ] A resource that exists for 30 seconds appears in the usage data (verifies CAP-4; sub-second resources are not captured)
+- [ ] A resource that exists for 30 seconds appears in the usage data (verifies CAP-4; any sub-minute lifetime qualifies, and 30 s is the test's chosen value; sub-second resources are not captured)
 - [ ] Deploying the metering system does not require changes to existing OSAC resources or workflows
 - [ ] A Tenant Admin can view usage grouped by project and see consumption per project within their tenant
+- [ ] A resource in FAILED state does not generate usage data, and usage recorded for a resource that later transitions to failed is adjusted retroactively (D-5)
 - [ ] Sending a duplicate event does not increase any meter value
 - [ ] Event, heartbeat, and dead-letter records remain available indefinitely to rebuild metering history
-- [ ] Aggregated data from 13 months ago is still queryable
+- [ ] Aggregated data from 13 months ago is still queryable (the configured retention may exceed, but never undercut, 13 months)
 - [ ] A Cloud Infrastructure Admin can add a new meter via configuration update and query it after deployment
 - [ ] Metering data includes catalog item and template references for any metered resource, enabling downstream systems to trace charges back to the originating catalog offer
 - [ ] Upgrading the metering system does not cause data loss or measurement gaps
@@ -188,42 +190,7 @@ Resources in failed state are not metered, regardless of the cause of failure. T
 
 OSAC provides usage data. The provider applies their own price schedule to generate charges. OSAC does not enforce prices or generate invoices. A separate PRD will address the costing layer to automate charge calculation.
 
-### Metering Units and Relationship to Existing OSAC Instance Types
-
-OSAC already defines instance types for VMaaS (per the [vm-instance-types](/enhancements/OSAC-46-vm-instance-types) EP) and host classes for CaaS worker nodes (e.g., `gpu-h100`, `cpu-only`). The metering system does not define, replace, or constrain these — it treats the instance type name and host class name as opaque string labels used for grouping. No changes to the existing instance type or host class model are required.
-
-VMaaS metering uses `instance-type-seconds` as its single meter. This aligns with how commercial clouds operate — CSPs define instance types that bundle CPU, RAM, and fixed boot disk into a named unit, and billing is expressed as uptime × rate per instance type. The instance type name from the OSAC catalog is used directly as a grouping dimension; the metering system is agnostic to the hardware composition behind the name. Storage is implicitly bundled when the CSP defines instance types that include a fixed boot disk.
-
-For CaaS, worker node pricing is per-node-seconds grouped by host class — the same instance-type-seconds model applied at the node level. The control plane is a separate flat-rate meter.
-
-### VMaaS
-
-`instance-type-seconds` measures how long (in seconds) a VM of a specific instance type is running. The instance type is the natural billing unit for VMaaS — it is what the tenant chose from the catalog, it encodes the hardware bundle (CPU, RAM, boot disk), and it maps directly to the provider's pricing schedule. Measuring in seconds aligns with commercial cloud billing practices and ensures all consumption is captured regardless of how briefly the VM runs.
-
-| Meter | Formula | Example (1 hour) |
-|-------|---------|-----------------|
-| instance-type-seconds | uptime × price/s | 3600s × $0.001/s = $3.60 |
-
-### CaaS
-
-CaaS uses two meters because its cost structure has two independent components. The **control plane** is a dedicated infrastructure component that runs on behalf of the tenant regardless of worker count — it has a fixed cost to the provider that must be recovered independently. **Worker nodes** are the primary compute resource and vary significantly in cost by hardware class: a GPU node carries far higher infrastructure cost than a CPU node. Metering workers grouped by host class enables differentiated pricing that reflects this cost difference.
-
-| Component | Meter | Formula | Example (1 hour, 2 GPU + 1 CPU worker) |
-|-----------|-------|---------|----------------------------------------|
-| Control plane | cluster uptime | uptime × price_cp | 3600s × $0.01 = $36.00 |
-| GPU workers | worker node-seconds (gpu-h100) | node-seconds × price_gpu | 7200 × $0.02 = $144.00 |
-| CPU workers | worker node-seconds (cpu-only) | node-seconds × price_cpu | 3600 × $0.005 = $18.00 |
-| **Total** | | | **$198.00/hour** |
-
-### MaaS
-
-MaaS uses per-token meters rather than per-time meters because inference cost is proportional to the number of tokens processed and generated, not wall-clock time. Three token types are metered separately: **input tokens** (the prompt the model must process), **output tokens** (the generated response — more expensive per token because they are generated sequentially), and **cached tokens** (input tokens served from a prompt cache at significantly lower compute cost, enabling the provider to pass a discount to tenants).
-
-| Component | Meter | Formula | Example |
-|-----------|-------|---------|---------|
-| Input tokens | input tokens | tokens × price/1K tokens | 1M × $0.003/1K = $3.00 |
-| Output tokens | output tokens | tokens × price/1K tokens | 500K × $0.015/1K = $7.50 |
-| Cached tokens | cached tokens | tokens × discounted price/1K | 200K × $0.0015/1K = $0.30 |
+The metering system treats instance type names (VMaaS) and host class names (CaaS worker nodes) as opaque grouping labels; it does not define, replace, or constrain them, and no changes to the existing instance type or host class model are required. VMaaS and CaaS workers are metered in instance-type- or host-class-seconds respectively, and a cluster's control plane is a separate meter. MaaS is metered per token rather than per time, because inference cost is proportional to the tokens processed and generated, not to wall-clock time. Price formulas and worked examples belong to the costing PRD.
 
 ---
 

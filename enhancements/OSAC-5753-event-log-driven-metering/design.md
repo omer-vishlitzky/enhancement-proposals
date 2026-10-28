@@ -3,10 +3,11 @@ title: event-log-driven-metering
 authors:
   - ovishlit@redhat.com
 creation-date: 2026-09-30
-last-updated: 2026-10-18
+last-updated: 2026-10-28
 tracking-link:
   - https://redhat.atlassian.net/browse/OSAC-985
   - https://redhat.atlassian.net/browse/OSAC-5753
+  - https://redhat.atlassian.net/browse/OSAC-6096
 prd:
   - "prd.md"
 see-also:
@@ -73,8 +74,11 @@ Compared with today's metering and the superseded designs:
   time in READY; if the cluster fails or is deleted before READY, it bills no installation time. Today it bills from
   the first PROGRESSING.
 - A cluster's worker nodes bill as the VMs or bare-metal hosts they are, instead of through the cluster's worker
-  meters (today, one per node set, multiplied by its node count). They bill like any VM or host, including while
-  the cluster installs.
+  meters (today, one per node set, multiplied by its node count), but under the cluster's gate (see Attribution):
+  while the cluster installs nothing bills, the round after the cluster reaches READY bills every worker
+  retroactively from its own start, and a cluster that fails or is deleted before READY bills nothing, workers
+  included. A CSP that wants workers billed regardless of the cluster's fate sets
+  `turns_billable_once_from: self` on their meters in a rule revision.
 - With the default rules, allocation meters (bare-metal allocation, volumes, external IPs, NAT gateways) bill until
   the object is physically deleted. OSAC-3141 and OSAC-3145 stopped volumes, external IPs, and NAT gateways at the
   deletion request.
@@ -182,25 +186,27 @@ A meter definition says, for one resource type:
 Every meter also sends these dimensions: `deployment` (an ID configured per installation that never changes),
 tenant, project, catalog, template, and meter type.
 
-**`once`.** Some time should be billed only if the resource eventually became usable. `once: <states>` means: after
-creation, and after any non-billable state, defer billing for a billable span until the resource reaches one of those
-states. When it does, bill retroactively from the start of that span, including any preceding billable states, then
-continue billing normally while the resource remains billable. If the resource enters a non-billable state first,
-do not bill that span. For example, a cluster with `once: READY` bills its preceding PROGRESSING time retroactively
-when it reaches READY, as well as its time in READY. If installation fails or the cluster is deleted before READY,
-that installation time is not billed.
+**`turns_billable_once`.** Some time should be billed only if the resource eventually became usable.
+`turns_billable_once: <states>` means: after creation, and after any non-billable state, defer billing for a
+billable span until the resource reaches one of those states. When it does, bill retroactively from the start of
+that span, including any preceding billable states, then continue billing normally while the resource remains
+billable. If the resource enters a non-billable state first, do not bill that span. For example, a cluster with
+`turns_billable_once: READY` bills its preceding PROGRESSING time retroactively when it reaches READY, as well as
+its time in READY. If installation fails or the cluster is deleted before READY, that installation time is not
+billed. For an owned resource, the confirming states are a gate inherited from its ownership root; see
+Attribution below.
 
 **Default meters.** FAILED is never billable. A CSP can change any of this with its own revisions (see Rule
 revisions).
 
-| Resource | Meter (unit) | Bills while | `once` | Resource dimensions |
+| Resource | Meter (unit) | Bills while | `turns_billable_once` | Resource dimensions |
 |---|---|---|---|---|
 | ComputeInstance | `compute` (second) | RUNNING | | instance type, image, boot disk size |
 | Cluster | `control_plane` (second) | PROGRESSING, READY | READY | template, version |
-| BareMetalInstance | `allocation` (second) | STARTING, RUNNING, STOPPING, STOPPED, DELETING | STARTING, RUNNING | instance type |
-| BareMetalInstance | `consumption` (second) | RUNNING | | instance type |
+| BareMetalInstance | `allocation` (second) | STARTING, RUNNING, STOPPING, STOPPED, DELETING | STARTING, RUNNING | instance type, cluster, node set |
+| BareMetalInstance | `consumption` (second) | RUNNING | | instance type, cluster, node set |
 | Volume | `capacity` (gibibyte_second) | AVAILABLE, DELETING | AVAILABLE | storage tier |
-| ExternalIP | `allocation` (second) | ALLOCATED, DELETING | ALLOCATED | pool, IP family, attribution, attached |
+| ExternalIP | `allocation` (second) | ALLOCATED, DELETING | ALLOCATED | pool, IP family, attached |
 | NATGateway | `allocation` (second) | READY, DELETING | READY | virtual network, external IP |
 
 - Volume capacity multiplies by the volume's provisioned GiB.
@@ -209,13 +215,38 @@ revisions).
 - The instance type is the one actually running, after any required restart.
 - Only block volumes with a vendor volume ID are billed. A volume's size can't change after creation.
 
-**No double billing.** Each physical resource bills itself, through its own meters. A cluster's worker nodes are
-ordinary VMs or bare-metal hosts, so they bill as VMs or hosts, and the cluster bills only its control plane.
-Nothing is billed twice, and metering never needs to know which resource belongs to which. The total is the same as
-billing workers through the cluster, as long as the CSP prices a worker node like any other VM or host. If a CSP
-wants cluster workers priced or reported separately, the alternative is to bill them through the cluster: every
-resource created for another records its owner at creation, and the default rules exclude owned resources from
-their own meters.
+**Attribution: workers bill under their cluster's gate.** Each physical resource bills itself, through its own
+meters: a worker host bills `allocation` and `consumption`, and the cluster bills `control_plane`. No meter ever
+counts another resource's usage, so nothing is billed twice, and the totals are the same as billing the cluster
+as one unit.
+
+What changes is the gate. Every meter's `turns_billable_once` lists the states that confirm a deferred span. For
+an owned resource, the gate is its ownership root's, and the root is the topmost owner, so a component of a
+component inherits from the top. Every resource created for another records its owner at creation, as a fixed
+field on its events. The gate is a latch: a span bills if the root reached a confirming state at any moment
+strictly before the span's end. Concretely:
+
+- While the cluster installs, nothing bills. The worker's hardware is allocated, but its billing waits.
+- The round after the cluster reaches READY bills the control plane retroactively and every worker's allocation
+  retroactively, from each worker's own start. The worker has no fact of its own in that round; the changed
+  cluster drags its workers into the round's recompute set.
+- A cluster that fails or is deleted before READY bills nothing, workers included. That forgiveness is the
+  deliberate default: the provider gives away the hardware reserved for a failed install rather than charging
+  for a cluster that never worked.
+- An upgrade, READY back to PROGRESSING and forward again, never stops billing. The latch does not close.
+- A span that closed before the gate opened never bills, even after the cluster later succeeds. A worker deleted
+  mid-install stays unbilled.
+
+Every worker heartbeat carries `cluster` and `node_set` dimensions, keyed by the reference's id, which never
+changes, so a report can ask what one cluster costs by grouping on the dimension.
+
+A CSP that wants workers billed regardless of the cluster's fate sets `turns_billable_once_from: self` on the
+worker's meters in a rule revision. Allocated hardware then bills from the worker's own start, failed cluster
+or not. That is rule data, not a code change.
+
+Two safety rules: if the root's history is missing, its resources' billing is held shut and logged, never a
+silent fallback to standalone billing; and the loader rejects a revision whose root resource defines conflicting
+gates, or that bills an inherited owned resource whose root has no meter.
 
 **Counting time.** Durations are exact, to the microsecond. A run, a span during which a meter is continuously
 billable, that lasts less than one second is not billed (CAP-4). Usage is split wherever the state, a dimension, or
@@ -265,7 +296,7 @@ data:
       unit: gibibyte_second
       billable_when:
         states: [AVAILABLE, DELETING]
-        once: [AVAILABLE]
+        turns_billable_once: [AVAILABLE]
         fields: { protocol: BLOCK, vendor_volume_id: set }
       multiplier: provisioned_size_gib
       dimensions: [storage_tier]
@@ -273,9 +304,11 @@ data:
 
 - Revisions are immutable ConfigMaps, and an admission policy blocks deleting them. Only cluster administrators can
   create them; metering only reads them.
-- Metering reads revisions when it starts, so a new revision needs a metering restart before its `effective_at`.
-  Metering refuses to start, with an alert, if a new revision would take effect in the past, or if a revision
-  it has already used is missing.
+- Metering loads revisions when it starts and re-checks them every minute, so a new revision takes effect at its
+  `effective_at` without a restart. Metering refuses to start, or stops with an alert if the check fails while it
+  is running, when a new revision would take effect before the billing position (the last round recorded in the
+  database, deliberately not the wall clock, so a backup restored from before a revision's activation still
+  records it), or when a revision it has already used is missing or changed.
 
 **Changing the metering code.** Rules are meant to change; the code that folds events and evaluates rules is not. CI
 replays recorded event logs to check that a new release computes the same usage for past events. If a release does
@@ -406,6 +439,8 @@ A late event then shows the VM had stopped at 10:29:30, so the large meter has n
 - **Meters of resources with new facts:** rows written after the event offset the previous round used, or dated
   after the previous round, because a writer's clock can run slightly ahead. Each such resource is recomputed from
   its own few rows.
+- **Meters of resources a changed ownership root owns,** because the root's gate opening or closing changes what
+  its owned resources bill. Each such resource is recomputed from its own rows, without a fact of its own.
 - **Meters of resource types a new revision affects,** once, in the round where the revision takes effect.
 
 Nothing else can change: a closed meter with no new facts gives the same answer as last time. So a round's work is
@@ -480,6 +515,10 @@ Once the cause is fixed, an operator replays them:
 2. Reset its position on the tenant's heartbeat topic to the earliest unhandled record's original offset.
 3. Mark the DLQ handled up to its end.
 4. Restart the adapter. The billing provider drops the heartbeats it already has.
+
+Until the handled-position consumer ships, the alert fires on new dead-letter records rather than on unhandled
+depth, and each dead-letter record carries its original heartbeat-topic offset for step 2. A follow-up task
+tracks the consumer.
 
 #### Recovery
 
@@ -584,8 +623,9 @@ Fulfillment also guarantees:
   - bills a heartbeat in the UTC-day period that contains its time;
   - rejects an invalid heartbeat synchronously;
   - accepts a correction dated in an already-invoiced period and applies it on the next invoice.
-- **Worker nodes on the tenant's topic:** a cluster's worker VMs and hosts belong to the cluster's tenant. Today they
-  belong to the system tenant, whose topic metering doesn't read, so until they move they aren't billed at all.
+- **Worker nodes on the tenant's topic:** a cluster's worker VMs and hosts are created in the cluster's project,
+  on the cluster's tenant, so their events land on the tenant's event topic. Fulfillment records the owning
+  cluster and node set at creation and rejects any later change to them.
 - **Kubernetes 1.30 or later**, for the admission policy that protects revisions.
 - **Deployment order:** fulfillment's capture changes and metering are deployed before the first tenant is onboarded.
 
@@ -611,7 +651,9 @@ Unit and integration tests, against real PostgreSQL and Kafka, gate every merge:
   every event delivered twice, or in shuffled order, gives the same `history`.
 - **Past results:** a new release computes the same usage as the previous release for recorded event logs.
 - **Meters:** every state transition of every meter, including deletion during provisioning, deletion after a
-  failure, and a cluster that fails before READY; a cluster's worker nodes bill only as VMs or hosts; a late event
+  failure, and a cluster that fails before READY; a cluster's worker nodes bill under the cluster's gate — nothing
+  during install, retroactively after READY, nothing when the cluster fails before READY — and a worker whose
+  root's history is missing is held shut, not billed standalone; a late event
   that removes a meter sends its full negative correction.
 - **Revisions:** shipped revisions parse, use only supported fields, and never change; a revision first loaded after
   its `effective_at` makes metering refuse to start.
