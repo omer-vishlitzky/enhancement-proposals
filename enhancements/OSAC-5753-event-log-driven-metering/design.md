@@ -183,8 +183,14 @@ A meter definition says, for one resource type:
   fixed at creation.
 - the multiplier (for example, a volume's size) and the dimensions to send.
 
-Every meter also sends these dimensions: `deployment` (an ID configured per installation that never changes),
-tenant, project, catalog, template, and meter type.
+Every meter also sends these identity dimensions:
+
+- `deployment`: a deployment ID configured per installation, which never changes
+- tenant
+- project
+- catalog
+- template
+- meter type
 
 **`turns_billable_once`.** Some time should be billed only if the resource eventually became usable.
 `turns_billable_once: <states>` means: after creation, and after any non-billable state, defer billing for a
@@ -196,7 +202,9 @@ its time in READY. If installation fails or the cluster is deleted before READY,
 billed. For an owned resource, the confirming states are a gate inherited from its ownership root; see
 Attribution below.
 
-**Default meters.** FAILED is never billable. A CSP can change any of this with its own revisions (see Rule
+#### Default meters
+
+FAILED is never billable. A CSP can change any of this with its own revisions (see Rule
 revisions).
 
 | Resource | Meter (unit) | Bills while | `turns_billable_once` | Resource dimensions |
@@ -330,7 +338,8 @@ The metering service runs three loops against one PostgreSQL database:
 The loops meet only in the database. A round waits until the fold has folded all of the tenant's events, so it never
 computes from half-folded facts. Pods may overlap, for example during an upgrade; each loop takes a per-tenant lock
 in PostgreSQL, so each tenant's work runs one at a time. The round's lock is separate from the event offset, so the
-fold keeps going while a round runs.
+fold keeps going while a round runs. Kafka consumer groups are not used: each loop's position is a PostgreSQL row
+that moves only with that loop's transaction, so an offset never advances past uncommitted work.
 
 #### Metering database
 
@@ -427,7 +436,7 @@ PostgreSQL. A round commits its ledger and its heartbeats together, or neither. 
 rebuilds the ledger from the heartbeat topic before anything is compared.
 
 A round visits meters in the ledger too, because a late event can remove a meter entirely. Example: VM-7 runs as type
-small; the operator reports a resize to large at 10:30, and the next three rounds send +60 s each on the large meter.
+small; the osac-operator reports a resize to large at 10:30, and the next three rounds send +60 s each on the large meter.
 A late event then shows the VM had stopped at 10:29:30, so the large meter has no usage at all. The 10:34 round sends
 −30 s on the small meter and −180 s on the large one, priced as large, so the charge cancels exactly.
 
@@ -509,7 +518,7 @@ tenant's dead-letter topic (DLQ) and keeps going. The DLQ is mandatory: the adap
 An alert stays on while a tenant's DLQ has unhandled records; the handled position is a consumer-group offset.
 Metering exposes, per tenant, the depth of the DLQ, the age of its oldest unhandled record, and how long the latest
 heartbeat has waited unconfirmed. The alerts key on these.
-Once the cause is fixed, an operator replays them:
+Once the cause is fixed, an admin replays them:
 
 1. Stop the adapter.
 2. Reset its position on the tenant's heartbeat topic to the earliest unhandled record's original offset.
@@ -593,9 +602,9 @@ Changing fields, and when their change time is set:
 | Field | Change time | Set by |
 |---|---|---|
 | State, on every resource | When the state changes | Whoever writes the state |
-| ComputeInstance instance type | When the new type is actually running, after any required restart | The operator |
+| ComputeInstance instance type | When the new type is actually running, after any required restart | The osac-operator |
 | Cluster version | When fulfillment accepts an upgrade | Fulfillment |
-| ExternalIP attachment and attribution | When the IP is attached or detached | The operator |
+| ExternalIP attachment and attribution | When the IP is attached or detached | The osac-operator |
 
 Fulfillment also guarantees:
 
